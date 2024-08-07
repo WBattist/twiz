@@ -32,101 +32,52 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
         super();
         if (!config.prefix) config.prefix = '/service/';
         this.config = config;
-        /**
-         * @type {InstanceType<Ultraviolet['BareClient']>}
-         */
         this.bareClient = new Ultraviolet.BareClient();
     }
-    /**
-     *
-     * @param {Event & {request: Request}} param0
-     * @returns
-     */
+
     route({ request }) {
-        if (request.url.startsWith(location.origin + this.config.prefix)) return true;
-        else return false;
+        return request.url.startsWith(location.origin + this.config.prefix);
     }
-    /**
-     *
-     * @param {Event & {request: Request}} param0
-     * @returns
-     */
+
     async fetch({ request }) {
-        /**
-         * @type {string|void}
-         */
         let fetchedURL;
 
         try {
-            if (!request.url.startsWith(location.origin + this.config.prefix))
-                return await fetch(request);
+            if (!this.route({ request })) return fetch(request);
 
             const ultraviolet = new Ultraviolet(this.config);
-
             if (typeof this.config.construct === 'function') {
                 this.config.construct(ultraviolet, 'service');
             }
 
             const db = await ultraviolet.cookie.db();
-
             ultraviolet.meta.origin = location.origin;
-            ultraviolet.meta.base = ultraviolet.meta.url = new URL(
-                ultraviolet.sourceUrl(request.url)
-            );
+            ultraviolet.meta.base = ultraviolet.meta.url = new URL(ultraviolet.sourceUrl(request.url));
 
-            const requestCtx = new RequestContext(
-                request,
-                ultraviolet,
-                !emptyMethods.includes(request.method.toUpperCase())
-                    ? await request.blob()
-                    : null
-            );
-
+            const requestCtx = new RequestContext(request, ultraviolet, !emptyMethods.includes(request.method.toUpperCase()) ? await request.blob() : null);
             if (ultraviolet.meta.url.protocol === 'blob:') {
                 requestCtx.blob = true;
-                requestCtx.base = requestCtx.url = new URL(
-                    requestCtx.url.pathname
-                );
+                requestCtx.base = requestCtx.url = new URL(requestCtx.url.pathname);
             }
 
-            if (
-                request.referrer &&
-                request.referrer.startsWith(location.origin)
-            ) {
-                const referer = new URL(
-                    ultraviolet.sourceUrl(request.referrer)
-                );
-
-                if (
-                    requestCtx.headers.origin ||
-                    (ultraviolet.meta.url.origin !== referer.origin &&
-                        request.mode === 'cors')
-                ) {
+            if (request.referrer && request.referrer.startsWith(location.origin)) {
+                const referer = new URL(ultraviolet.sourceUrl(request.referrer));
+                if (requestCtx.headers.origin || (ultraviolet.meta.url.origin !== referer.origin && request.mode === 'cors')) {
                     requestCtx.headers.origin = referer.origin;
                 }
-
                 requestCtx.headers.referer = referer.href;
             }
 
             const cookies = (await ultraviolet.cookie.getCookies(db)) || [];
-            const cookieStr = ultraviolet.cookie.serialize(
-                cookies,
-                ultraviolet.meta,
-                false
-            );
-
+            const cookieStr = ultraviolet.cookie.serialize(cookies, ultraviolet.meta, false);
             requestCtx.headers['user-agent'] = navigator.userAgent;
-
             if (cookieStr) requestCtx.headers.cookie = cookieStr;
 
             const reqEvent = new HookEvent(requestCtx, null, null);
             this.emit('request', reqEvent);
-
             if (reqEvent.intercepted) return reqEvent.returnValue;
 
-            fetchedURL = requestCtx.blob
-                ? 'blob:' + location.origin + requestCtx.url.pathname
-                : requestCtx.url;
+            fetchedURL = requestCtx.blob ? 'blob:' + location.origin + requestCtx.url.pathname : requestCtx.url;
 
             const response = await this.bareClient.fetch(fetchedURL, {
                 headers: requestCtx.headers,
@@ -140,169 +91,29 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
 
             const responseCtx = new ResponseContext(requestCtx, response);
             const resEvent = new HookEvent(responseCtx, null, null);
-
             this.emit('beforemod', resEvent);
             if (resEvent.intercepted) return resEvent.returnValue;
 
-            for (const name of cspHeaders) {
-                if (responseCtx.headers[name]) delete responseCtx.headers[name];
-            }
+            this.stripCSPHeaders(responseCtx);
+            this.rewriteLocationHeader(responseCtx, ultraviolet);
 
-            if (responseCtx.headers.location) {
-                responseCtx.headers.location = ultraviolet.rewriteUrl(
-                    responseCtx.headers.location
-                );
-            }
-
-            // downloads
             if (["document", "iframe"].includes(request.destination)) {
-                const header = responseCtx.getHeader("content-disposition");
-
-                // validate header and test for filename
-                if (!/\s*?((inline|attachment);\s*?)filename=/i.test(header)) {
-                    // if filename= wasn't specified then maybe the remote specified to download this as an attachment?
-                    // if it's invalid then we can still possibly test for the attachment/inline type
-                    const type = /^\s*?attachment/i.test(header)
-                        ? 'attachment'
-                        : 'inline';
-
-                    // set the filename
-                    const [filename] = new URL(response.finalURL).pathname
-                        .split('/')
-                        .slice(-1);
-
-                    responseCtx.headers[
-                        'content-disposition'
-                    ] = `${type}; filename=${JSON.stringify(filename)}`;
-                }
+                this.handleContentDispositionHeader(responseCtx);
             }
 
             if (responseCtx.headers['set-cookie']) {
-                Promise.resolve(
-                    ultraviolet.cookie.setCookies(
-                        responseCtx.headers['set-cookie'],
-                        db,
-                        ultraviolet.meta
-                    )
-                ).then(() => {
-                    self.clients.matchAll().then(function (clients) {
-                        clients.forEach(function (client) {
-                            client.postMessage({
-                                msg: 'updateCookies',
-                                url: ultraviolet.meta.url.href,
-                            });
-                        });
-                    });
-                });
-                delete responseCtx.headers['set-cookie'];
+                await this.setCookiesAndUpdateClients(ultraviolet, responseCtx, db);
             }
 
             if (responseCtx.body) {
-                switch (request.destination) {
-                    case 'script':
-                        responseCtx.body = ultraviolet.js.rewrite(
-                            await response.text()
-                        );
-                        break;
-                    case 'worker':
-                        {
-                            // craft a JS-safe list of arguments
-                            const scripts = [
-                                ultraviolet.bundleScript,
-                                ultraviolet.clientScript,
-                                ultraviolet.configScript,
-                                ultraviolet.handlerScript,
-                            ]
-                                .map((script) => JSON.stringify(script))
-                                .join(',');
-                            responseCtx.body = `(async ()=>{${ultraviolet.createJsInject(
-                                ultraviolet.cookie.serialize(
-                                    cookies,
-                                    ultraviolet.meta,
-                                    true
-                                ),
-                                request.referrer
-                            )} importScripts(${scripts}); await __uv$promise;\n`;
-                            responseCtx.body += ultraviolet.js.rewrite(
-                                await response.text()
-                            );
-							responseCtx.body += "\n})()";
-                        }
-                        break;
-                    case 'style':
-                        responseCtx.body = ultraviolet.rewriteCSS(
-                            await response.text()
-                        );
-                        break;
-                    case 'iframe':
-                    case 'document':
-                        if (responseCtx.getHeader("content-type") && responseCtx.getHeader("content-type").startsWith("text/html")) {
-                            let modifiedResponse = await response.text();
-                            if (Array.isArray(this.config.inject)) {
-                                const headPosition = modifiedResponse.indexOf('<head>');
-                                const upperHead = modifiedResponse.indexOf('<HEAD>');
-                                const bodyPosition = modifiedResponse.indexOf('<body>');
-                                const upperBody = modifiedResponse.indexOf('<BODY>');
-                                const url = new URL(fetchedURL)
-                                const injectArray = this.config.inject;
-                                for (const inject of injectArray) {
-                                    const regex = new RegExp(inject.host)
-                                    if (regex.test(url.host)) {
-                                        if (inject.injectTo === "head") {
-                                            if (headPosition !== -1 || upperHead !== -1) {
-                                                modifiedResponse =
-                                                    modifiedResponse.slice(
-                                                        0,
-                                                        headPosition
-                                                    ) +
-                                                    `${inject.html}` +
-                                                    modifiedResponse.slice(headPosition);
-                                            }
-                                        } else if (inject.injectTo === "body") {
-                                            if (bodyPosition !== -1 || upperBody !== -1) {
-                                                modifiedResponse =
-                                                    modifiedResponse.slice(
-                                                        0,
-                                                        bodyPosition
-                                                    ) +
-                                                    `${inject.html}` +
-                                                    modifiedResponse.slice(bodyPosition);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            responseCtx.body = ultraviolet.rewriteHtml(
-                                modifiedResponse,
-                                {
-                                    document: true,
-                                    injectHead: ultraviolet.createHtmlInject(
-                                        ultraviolet.handlerScript,
-                                        ultraviolet.bundleScript,
-                                        ultraviolet.clientScript,
-                                        ultraviolet.configScript,
-                                        ultraviolet.cookie.serialize(
-                                            cookies,
-                                            ultraviolet.meta,
-                                            true
-                                        ),
-                                        request.referrer
-                                    ),
-                                }
-                            );
-                        }
-                        break;
-                    default:
-                        break;
-                }
+                responseCtx.body = await this.handleResponseBody(request, responseCtx, ultraviolet, cookies);
             }
 
             if (requestCtx.headers.accept === 'text/event-stream') {
                 responseCtx.headers['content-type'] = 'text/event-stream';
             }
             if (crossOriginIsolated) {
-                responseCtx.headers['Cross-Origin-Embedder-Policy'] =
-                    'require-corp';
+                responseCtx.headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
             }
 
             this.emit('response', resEvent);
@@ -314,197 +125,168 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
                 statusText: responseCtx.statusText,
             });
         } catch (err) {
-            if (!['document', 'iframe'].includes(request.destination))
+            if (!['document', 'iframe'].includes(request.destination)) {
                 return new Response(undefined, { status: 500 });
+            }
 
             console.error(err);
-
             return renderError(err, fetchedURL);
         }
     }
+
+    stripCSPHeaders(responseCtx) {
+        for (const name of cspHeaders) {
+            if (responseCtx.headers[name]) delete responseCtx.headers[name];
+        }
+    }
+
+    rewriteLocationHeader(responseCtx, ultraviolet) {
+        if (responseCtx.headers.location) {
+            responseCtx.headers.location = ultraviolet.rewriteUrl(responseCtx.headers.location);
+        }
+    }
+
+    handleContentDispositionHeader(responseCtx) {
+        const header = responseCtx.getHeader("content-disposition");
+        if (!/\s*?((inline|attachment);\s*?)filename=/i.test(header)) {
+            const type = /^\s*?attachment/i.test(header) ? 'attachment' : 'inline';
+            const [filename] = new URL(responseCtx.request.url).pathname.split('/').slice(-1);
+            responseCtx.headers['content-disposition'] = `${type}; filename=${JSON.stringify(filename)}`;
+        }
+    }
+
+    async setCookiesAndUpdateClients(ultraviolet, responseCtx, db) {
+        await ultraviolet.cookie.setCookies(responseCtx.headers['set-cookie'], db, ultraviolet.meta);
+        const clients = await self.clients.matchAll();
+        for (const client of clients) {
+            client.postMessage({
+                msg: 'updateCookies',
+                url: ultraviolet.meta.url.href,
+            });
+        }
+        delete responseCtx.headers['set-cookie'];
+    }
+
+    async handleResponseBody(request, responseCtx, ultraviolet, cookies) {
+        switch (request.destination) {
+            case 'script':
+                return ultraviolet.js.rewrite(await responseCtx.raw.text());
+            case 'worker': {
+                const scripts = [ultraviolet.bundleScript, ultraviolet.clientScript, ultraviolet.configScript, ultraviolet.handlerScript]
+                    .map(script => JSON.stringify(script))
+                    .join(',');
+                let body = `(async ()=>{${ultraviolet.createJsInject(ultraviolet.cookie.serialize(cookies, ultraviolet.meta, true), request.referrer)} importScripts(${scripts}); await __uv$promise;\n`;
+                body += ultraviolet.js.rewrite(await responseCtx.raw.text());
+                body += "\n})()";
+                return body;
+            }
+            case 'style':
+                return ultraviolet.rewriteCSS(await responseCtx.raw.text());
+            case 'iframe':
+            case 'document':
+                if (responseCtx.getHeader("content-type")?.startsWith("text/html")) {
+                    return this.handleHtmlResponse(responseCtx, ultraviolet, cookies, request.referrer);
+                }
+                break;
+        }
+        return responseCtx.raw.body;
+    }
+
+    async handleHtmlResponse(responseCtx, ultraviolet, cookies, referrer) {
+        let modifiedResponse = await responseCtx.raw.text();
+        if (Array.isArray(this.config.inject)) {
+            const injectArray = this.config.inject;
+            const url = new URL(responseCtx.request.url);
+            for (const inject of injectArray) {
+                const regex = new RegExp(inject.host);
+                if (regex.test(url.host)) {
+                    if (inject.injectTo === "head") {
+                        modifiedResponse = this.injectIntoHtml(modifiedResponse, '<head>', inject.html);
+                    } else if (inject.injectTo === "body") {
+                        modifiedResponse = this.injectIntoHtml(modifiedResponse, '<body>', inject.html);
+                    }
+                }
+            }
+        }
+        return ultraviolet.rewriteHtml(modifiedResponse, {
+            document: true,
+            injectHead: ultraviolet.createHtmlInject(
+                ultraviolet.handlerScript,
+                ultraviolet.bundleScript,
+                ultraviolet.clientScript,
+                ultraviolet.configScript,
+                ultraviolet.cookie.serialize(cookies, ultraviolet.meta, true),
+                referrer
+            ),
+        });
+    }
+
+    injectIntoHtml(html, tag, content) {
+        const upperTag = tag.toUpperCase();
+        const position = html.indexOf(tag);
+        const upperPosition = html.indexOf(upperTag);
+        if (position !== -1 || upperPosition !== -1) {
+            return html.slice(0, position) + content + html.slice(position);
+        }
+        return html;
+    }
+
     static Ultraviolet = Ultraviolet;
 }
 
 self.UVServiceWorker = UVServiceWorker;
 
 class ResponseContext {
-    /**
-     *
-     * @param {RequestContext} request
-     * @param {import("@mercuryworkshop/bare-mux").BareResponseFetch} response
-     */
     constructor(request, response) {
         this.request = request;
         this.raw = response;
         this.ultraviolet = request.ultraviolet;
-        this.headers = {};
-        // eg set-cookie
-        for (const key in response.rawHeaders)
-            this.headers[key.toLowerCase()] = response.rawHeaders[key];
+        this.headers = Object.fromEntries(response.rawHeaders);
         this.status = response.status;
         this.statusText = response.statusText;
         this.body = response.body;
     }
+
     get url() {
         return this.request.url;
     }
+
     get base() {
         return this.request.base;
     }
+
     set base(val) {
         this.request.base = val;
     }
-    //the header value might be an array, so this function is used to 
-    //retrieve the value when it needs to be compared against a string
+
     getHeader(key) {
-        if (Array.isArray(this.headers[key])) {
-            return this.headers[key][0];
-        }
-        return this.headers[key];
+        return Array.isArray(this.headers[key]) ? this.headers[key][0] : this.headers[key];
     }
 }
 
 class RequestContext {
-    /**
-     *
-     * @param {Request} request
-     * @param {Ultraviolet} ultraviolet
-     * @param {BodyInit} body
-     */
-    constructor(request, ultraviolet, body = null) {
-        this.ultraviolet = ultraviolet;
-        this.request = request;
-        this.headers = Object.fromEntries(request.headers.entries());
+    constructor(request, ultraviolet, body) {
+        this.url = request.url;
         this.method = request.method;
-        this.body = body || null;
-        this.cache = request.cache;
-        this.redirect = request.redirect;
-        this.credentials = 'omit';
-        this.mode = request.mode === 'cors' ? request.mode : 'same-origin';
+        this.headers = Object.fromEntries(request.headers);
+        this.body = body;
+        this.ultraviolet = ultraviolet;
+        this.base = null;
         this.blob = false;
-    }
-    get url() {
-        return this.ultraviolet.meta.url;
-    }
-    set url(val) {
-        this.ultraviolet.meta.url = val;
-    }
-    get base() {
-        return this.ultraviolet.meta.base;
-    }
-    set base(val) {
-        this.ultraviolet.meta.base = val;
     }
 }
 
 class HookEvent {
-    #intercepted;
-    #returnValue;
-    constructor(data = {}, target = null, that = null) {
-        this.#intercepted = false;
-        this.#returnValue = null;
-        this.data = data;
-        this.target = target;
-        this.that = that;
-    }
-    get intercepted() {
-        return this.#intercepted;
-    }
-    get returnValue() {
-        return this.#returnValue;
-    }
-    respondWith(input) {
-        this.#returnValue = input;
-        this.#intercepted = true;
+    constructor(context, intercepted, returnValue) {
+        this.context = context;
+        this.intercepted = intercepted;
+        this.returnValue = returnValue;
     }
 }
 
-/**
- *
- * @param {string} trace
- * @param {string} fetchedURL
- * @returns
- */
-function errorTemplate(
-    trace,
-    fetchedURL,
-) {
-    // turn script into a data URI so we don't have to escape any HTML values
-    const script = `
-        errorTrace.value = ${JSON.stringify(trace)};
-        fetchedURL.textContent = ${JSON.stringify(fetchedURL)};
-        for (const node of document.querySelectorAll("#uvHostname")) node.textContent = ${JSON.stringify(
-            location.hostname
-        )};
-        reload.addEventListener("click", () => location.reload());
-        uvVersion.textContent = ${JSON.stringify(
-            process.env.ULTRAVIOLET_VERSION
-        )};
-    `
-
-    return (
-        `<!DOCTYPE html>
-        <html>
-        <head>
-        <meta charset='utf-8' />
-        <title>Error</title>
-        <style>
-        * { background-color: white }
-        </style>
-        </head>
-        <body>
-        <h1 id='errorTitle'>Error processing your request</h1>
-        <hr />
-        <p>Failed to load <b id="fetchedURL"></b></p>
-        <p id="errorMessage">Internal Server Error</p>
-        <textarea id="errorTrace" cols="40" rows="10" readonly></textarea>
-        <p>Try:</p>
-        <ul>
-        <li>Checking your internet connection</li>
-        <li>Verifying you entered the correct address</li>
-        <li>Clearing the site data</li>
-        <li>Contacting <b id="uvHostname"></b>'s administrator</li>
-        <li>Verify the server isn't censored</li>
-        </ul>
-        <p>If you're the administrator of <b id="uvHostname"></b>, try:</p>
-        <ul>
-        <li>Restarting your server</li>
-        <li>Updating Ultraviolet</li>
-        <li>Troubleshooting the error on the <a href="https://github.com/titaniumnetwork-dev/Ultraviolet" target="_blank">GitHub repository</a></li>
-        </ul>
-        <button id="reload">Reload</button>
-        <hr />
-        <p><i>Ultraviolet v<span id="uvVersion"></span></i></p>
-        <script src="${
-            'data:application/javascript,' + encodeURIComponent(script)
-        }"></script>
-        </body>
-        </html>
-        `
-    );
-}
-
-/**
- *
- * @param {unknown} err
- * @param {string} fetchedURL
- */
-function renderError(err, fetchedURL) {
-    let headers = {
-        'content-type': 'text/html',
-    };
-    if (crossOriginIsolated) {
-        headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
-    }
-
-    return new Response(
-        errorTemplate(
-            String(err),
-            fetchedURL
-        ),
-        {
-            status: 500,
-            headers: headers
-        }
-    );
-}
+self.addEventListener('fetch', (event) => {
+    event.respondWith((async () => {
+        const uvServiceWorker = new UVServiceWorker();
+        return uvServiceWorker.fetch(event);
+    })());
+});
